@@ -1,0 +1,23 @@
+{
+  "default": true,
+  "MD001": true,
+  "MD003": { "style": "atx" },
+  "MD004": { "style": "dash" },
+  "MD005": true,
+  "MD009": true,
+  "MD010": true,
+  "MD012": { "maximum": 2 },
+  "MD022": true,
+  "MD023": true,
+  "MD025": true,
+  "MD031": true,
+  "MD032": true,
+  "MD033": {
+    "allowed_elements": ["table", "thead", "tbody", "tr", "th", "td", "br", "sup", "sub"]
+  },
+  "MD047": true,
+  "MD013": false,
+  "MD024": false,
+  "MD036": false,
+  "MD060": false
+}
