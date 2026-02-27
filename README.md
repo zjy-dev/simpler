@@ -56,6 +56,7 @@ uv venv .venv && uv pip install reportlab markdown
 简化《MySQL 是怎样运行的：从根儿上理解 MySQL》, 要求:
 
 - 内容在 git@github.com:Relph1119/mysql-learning-notes.git 仓库, 自己 clone 并 mv 进 source, 注意维护好图片
+- 以后端面试为目的简化
 - 直接删掉无关章节, 可以重新编号
 - 只保留纯知识内容, 引用、问题、作业都删掉
 - 抛砖引玉的砖也删掉（比如调度算法只留多级反馈队列就够了）
