@@ -14,6 +14,10 @@ import re
 import sys
 import glob
 
+from pygments import highlight as pyg_highlight
+from pygments.lexers import get_lexer_by_name, TextLexer
+from pygments.token import Token
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm, cm
 from reportlab.lib.colors import HexColor, Color, white, black
@@ -28,10 +32,11 @@ from reportlab.platypus import (
     PageBreak,
     Table,
     TableStyle,
-    Preformatted,
     KeepTogether,
     NextPageTemplate,
+    Image as RLImage,
 )
+from reportlab.platypus.xpreformatted import XPreformatted
 from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -164,6 +169,69 @@ def escape_xml(text):
     return text
 
 
+def _wrap_cjk_with_font(text):
+    """将文本中连续的 CJK 字符段用 NotoSansSC 字体标签包裹，使 NotoMono 代码块能正确显示中文。"""
+    # 匹配连续的 CJK 统一表意文字、CJK 标点、全角字符
+    return re.sub(
+        r'([\u2E80-\u9FFF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF\U00020000-\U0002FA1F]+)',
+        r'<font name="NotoSansSC">\1</font>',
+        text,
+    )
+
+
+# ── Pygments 语法高亮配色（暖色调，搭配 CODE_BG #F5F0E8）──────────
+_TOKEN_COLORS = {
+    Token.Keyword:             "#8B1A1A",   # 关键字：深红
+    Token.Keyword.Type:        "#2E6DA4",   # 类型关键字：蓝
+    Token.Name.Function:       "#6A3D9A",   # 函数名：紫
+    Token.Name.Class:          "#6A3D9A",   # 类名：紫
+    Token.Name.Builtin:        "#6A3D9A",   # 内建名：紫
+    Token.Literal.String:      "#2D882D",   # 字符串：绿
+    Token.Literal.String.Doc:  "#2D882D",
+    Token.Literal.Number:      "#B85C00",   # 数字：橙
+    Token.Comment:             "#888888",   # 注释：灰
+    Token.Comment.Single:      "#888888",
+    Token.Comment.Multiline:   "#888888",
+    Token.Comment.Preproc:     "#8B1A1A",   # 预处理指令：深红
+    Token.Operator:            "#666666",   # 运算符：深灰
+    Token.Punctuation:         "#444444",   # 标点：深灰
+}
+
+
+def _get_token_color(ttype):
+    """查找 token 类型对应的颜色，沿 token 继承链向上找。"""
+    while ttype:
+        if ttype in _TOKEN_COLORS:
+            return _TOKEN_COLORS[ttype]
+        ttype = ttype.parent
+    return None
+
+
+def _highlight_code(code, lang=""):
+    """用 Pygments 对代码做语法高亮，输出带 <font> 标签的 XML 字符串（CJK 已处理）。"""
+    try:
+        lexer = get_lexer_by_name(lang, stripall=False) if lang else TextLexer()
+    except Exception:
+        lexer = TextLexer()
+
+    tokens = lexer.get_tokens(code)
+    parts = []
+    for ttype, value in tokens:
+        escaped = escape_xml(value)
+        # CJK 字符用中文字体包裹
+        escaped = _wrap_cjk_with_font(escaped)
+        color = _get_token_color(ttype)
+        if color:
+            # 注释用斜体
+            if ttype in Token.Comment:
+                parts.append(f'<font color="{color}"><i>{escaped}</i></font>')
+            else:
+                parts.append(f'<font color="{color}">{escaped}</font>')
+        else:
+            parts.append(escaped)
+    return "".join(parts)
+
+
 def _latex_to_readable(text):
     """将简单 LaTeX 数学语法转为 reportlab XML 可渲染的近似形式。"""
     text = re.sub(r'\\text\{([^}]+)\}', r'\1', text)        # \text{x} → x
@@ -248,9 +316,11 @@ class MarkdownToFlowables:
     def __init__(self, styles):
         self.S = styles
         self.toc_entries = []  # [(level, title, key), ...]
+        self.base_dir = "."   # 图片相对路径的基准目录
 
     def convert_file(self, filepath):
         """读取一个 .md 文件，返回 flowable 列表。"""
+        self.base_dir = os.path.dirname(os.path.abspath(filepath))
         with open(filepath, "r", encoding="utf-8") as f:
             text = f.read()
         return self._parse(text)
@@ -262,15 +332,23 @@ class MarkdownToFlowables:
         while i < len(lines):
             line = lines[i]
 
+            # ── 图片 ![alt](path) ──
+            img_m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)', line.strip())
+            if img_m:
+                flowables.extend(self._make_image(img_m.group(2), img_m.group(1)))
+                i += 1
+                continue
+
             # ── 围栏代码块 ──
             if line.startswith("```"):
+                lang = line.strip("`").strip() or ""  # 提取语言标识
                 code_lines = []
                 i += 1
                 while i < len(lines) and not lines[i].startswith("```"):
                     code_lines.append(lines[i])
                     i += 1
                 i += 1  # skip closing ```
-                flowables.extend(self._make_code_block(code_lines))
+                flowables.extend(self._make_code_block(code_lines, lang))
                 continue
 
             # ── 表格 ──
@@ -405,11 +483,55 @@ class MarkdownToFlowables:
             items.append(Spacer(1, 8))
         return items
 
-    def _make_code_block(self, code_lines):
-        """生成代码块 flowable（带浅色背景）。"""
+    def _make_image(self, src, alt=""):
+        """将 Markdown 图片转为 PDF 内嵌图片，自动缩放到页面宽度以内。"""
+        img_path = os.path.join(self.base_dir, src)
+        if not os.path.isfile(img_path):
+            # 图片找不到时退化为文字说明
+            label = alt or src
+            return [
+                Paragraph(
+                    f'<i><font color="#999999">[图片: {escape_xml(label)}]</font></i>',
+                    self.S["body"],
+                ),
+                Spacer(1, 4),
+            ]
+        max_w = PAGE_W - MARGIN_L - MARGIN_R
+        max_h = 260  # 限制图片最大高度（点），避免撑爆页面
+        try:
+            img = RLImage(img_path)
+            iw, ih = img.imageWidth, img.imageHeight
+            if iw <= 0 or ih <= 0:
+                raise ValueError("bad dimensions")
+            ratio = min(max_w / iw, max_h / ih, 1.0)  # 不放大，只缩小
+            img.drawWidth = iw * ratio
+            img.drawHeight = ih * ratio
+            img.hAlign = "CENTER"
+            result = [Spacer(1, 4), img, Spacer(1, 4)]
+            if alt:
+                result.append(
+                    Paragraph(
+                        f'<font size="8" color="#888888">{escape_xml(alt)}</font>',
+                        ParagraphStyle("img_caption", parent=self.S["body"], alignment=TA_CENTER, spaceBefore=0, spaceAfter=6),
+                    )
+                )
+            return result
+        except Exception as e:
+            label = alt or src
+            return [
+                Paragraph(
+                    f'<i><font color="#999999">[图片加载失败: {escape_xml(label)} — {escape_xml(str(e))}]</font></i>',
+                    self.S["body"],
+                ),
+                Spacer(1, 4),
+            ]
+
+    def _make_code_block(self, code_lines, lang=""):
+        """生成代码块 flowable（带浅色背景 + 语法高亮）。"""
         code_text = "\n".join(code_lines)
-        # 用 Preformatted 保持格式
-        pre = Preformatted(escape_xml(code_text), self.S["code"])
+        code_xml = _highlight_code(code_text, lang)
+        # 用 XPreformatted 保持格式（继承自 Paragraph，正确处理 XML 实体）
+        pre = XPreformatted(code_xml, self.S["code"])
         # 包在表格里加背景色
         t = Table(
             [[pre]],
