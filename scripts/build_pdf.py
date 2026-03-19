@@ -7,12 +7,15 @@
     python build_pdf.py           # 构建全部已注册的书
     python build_pdf.py ostep     # 只构建 OSTEP
     python build_pdf.py redis     # 只构建 Redis
+    python build_pdf.py langchain # 只构建 LangChain
 """
 
 import os
 import re
 import sys
 import glob
+import json
+from pathlib import Path
 
 from pygments import highlight as pyg_highlight
 from pygments.lexers import get_lexer_by_name, TextLexer
@@ -59,6 +62,9 @@ MARGIN_L = 2.2 * cm
 MARGIN_R = 2.0 * cm
 MARGIN_T = 2.4 * cm
 MARGIN_B = 2.2 * cm
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SIMPLIFIED_DIR = SCRIPT_DIR.parent / "simplified"
 
 # ── 注册字体 ──────────────────────────────────────────────────────
 # 使用文泉驿微米黑（WenQuanYi Micro Hei）—— 风格最接近微软雅黑的开源字体
@@ -261,13 +267,32 @@ def _latex_inline_replace(m):
     return f'<font color="#D9534F"><i>{inner}</i></font>'
 
 
+def _inline_code_xml(content: str) -> str:
+    """将行内代码内容渲染为混合字体 XML。
+    NotoMono 不含中文字形，需将非 ASCII 片段切换到 NotoSansSC，
+    否则中文字符会隐形，只剩 ASCII 符号（如 +）可见。
+    """
+    escaped = escape_xml(content)
+    # 按 ASCII / 非ASCII 交替切分，分别套不同字体标签
+    segments = re.split(r'([\x00-\x7F]+)', escaped)
+    parts = []
+    for seg in segments:
+        if not seg:
+            continue
+        if re.match(r'^[\x00-\x7F]+$', seg):
+            parts.append(f'<font name="NotoMono" size="8.5">{seg}</font>')
+        else:
+            parts.append(f'<font name="NotoSansSC" size="8.5">{seg}</font>')
+    return f'<font color="#8B4513">{"".join(parts)}</font>'
+
+
 def inline_markup(text):
     """将行内 Markdown 标记转换为 reportlab XML 标签。"""
     # 先提取行内代码，用占位符保护，防止内部 ** / $ 被二次处理
     code_placeholders = {}
     def _save_code(m):
         key = f"\x00C{len(code_placeholders)}\x00"
-        code_placeholders[key] = f'<font name="NotoMono" size="8.5" color="#8B4513">{escape_xml(m.group(1))}</font>'
+        code_placeholders[key] = _inline_code_xml(m.group(1))
         return key
     text = re.sub(r'`([^`]+)`', _save_code, text)
 
@@ -527,25 +552,38 @@ class MarkdownToFlowables:
             ]
 
     def _make_code_block(self, code_lines, lang=""):
-        """生成代码块 flowable（带浅色背景 + 语法高亮）。"""
-        code_text = "\n".join(code_lines)
-        code_xml = _highlight_code(code_text, lang)
-        # 用 XPreformatted 保持格式（继承自 Paragraph，正确处理 XML 实体）
-        pre = XPreformatted(code_xml, self.S["code"])
-        # 包在表格里加背景色
-        t = Table(
-            [[pre]],
-            colWidths=[PAGE_W - MARGIN_L - MARGIN_R - 12],
-            style=TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), CODE_BG),
-                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_GREY),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ]),
-        )
-        return [Spacer(1, 4), t, Spacer(1, 4)]
+        """生成代码块 flowable（带浅色背景 + 语法高亮）。
+
+        ReportLab 无法在单个表格单元格里分页，长代码块需要先切成多个小块，
+        否则会直接触发 LayoutError。
+        """
+        max_lines_per_chunk = 32
+        chunks = [
+            code_lines[i:i + max_lines_per_chunk]
+            for i in range(0, len(code_lines), max_lines_per_chunk)
+        ] or [[]]
+
+        flowables = []
+        for chunk in chunks:
+            code_text = "\n".join(chunk)
+            code_xml = _highlight_code(code_text, lang)
+            # 用 XPreformatted 保持格式（继承自 Paragraph，正确处理 XML 实体）
+            pre = XPreformatted(code_xml, self.S["code"])
+            # 包在表格里加背景色
+            t = Table(
+                [[pre]],
+                colWidths=[PAGE_W - MARGIN_L - MARGIN_R - 12],
+                style=TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), CODE_BG),
+                    ("BOX", (0, 0), (-1, -1), 0.5, BORDER_GREY),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ]),
+            )
+            flowables.extend([Spacer(1, 4), t, Spacer(1, 4)])
+        return flowables
 
     def _make_table(self, table_lines):
         """生成表格 flowable。"""
@@ -624,7 +662,7 @@ def _draw_cover_bg(canvas_obj, doc):
 
 # ── 书籍配置 ──────────────────────────────────────────────────────
 
-BOOKS = {
+DEFAULT_BOOKS = {
     "ostep": {
         "title": "OSTEP 精简版",
         "subtitle": "Operating Systems: Three Easy Pieces",
@@ -692,12 +730,116 @@ BOOKS = {
 }
 
 
+def _slug_to_display_name(slug):
+    """将目录名转成封面可读标题。"""
+    text = slug.replace("-", " ").strip()
+    if not text:
+        return "未命名文档"
+    # 英文 slug 做标题化，中文保持原样
+    return " ".join(part.capitalize() for part in text.split())
+
+
+def _default_part_name(part_key, order):
+    """为缺省配置推断 part 标题。"""
+    if part_key == "00":
+        return "附录 / 速查"
+    return f"第 {order} 部分"
+
+
+def _infer_parts_from_files(files, existing_parts=None):
+    """根据文件名中的 part 编号推断分部名称。"""
+    parts = dict(existing_parts or {})
+    seen = []
+    for fname in files:
+        stem = fname.rsplit(".", 1)[0]
+        tokens = stem.split("-")
+        if len(tokens) >= 3:
+            part_key = tokens[-2]
+            if part_key not in seen:
+                seen.append(part_key)
+
+    numbered_order = 1
+    for part_key in seen:
+        if part_key not in parts:
+            parts[part_key] = _default_part_name(part_key, numbered_order)
+        if part_key != "00":
+            numbered_order += 1
+    return parts
+
+
+def _autodiscover_book_config(book_key, book_dir):
+    """为未显式注册的新书生成兜底配置。"""
+    files = sorted(path.name for path in book_dir.glob("*.md"))
+    display_name = _slug_to_display_name(book_key)
+    return {
+        "title": f"{display_name} 精简版",
+        "subtitle": "",
+        "tagline": "精简笔记",
+        "tags": "",
+        "dir": book_dir.name,
+        "files": files,
+        "parts": _infer_parts_from_files(files),
+    }
+
+
+def _normalize_book_config(book_key, raw_config):
+    """标准化单本书配置，并在缺省时自动发现 Markdown 文件。"""
+    book = dict(raw_config)
+    book.setdefault("dir", book_key)
+
+    book_dir = SIMPLIFIED_DIR / book["dir"]
+    files = book.get("files") or sorted(path.name for path in book_dir.glob("*.md"))
+    normalized_files = []
+    for fname in files:
+        normalized_files.append(fname if fname.endswith(".md") else f"{fname}.md")
+    book["files"] = normalized_files
+    book["parts"] = _infer_parts_from_files(normalized_files, book.get("parts"))
+
+    display_name = _slug_to_display_name(book["dir"])
+    book.setdefault("title", f"{display_name} 精简版")
+    book.setdefault("subtitle", "")
+    book.setdefault("tagline", "精简笔记")
+    book.setdefault("tags", "")
+    return book
+
+
+def load_books():
+    """加载内置书籍配置、book.json，以及自动发现的书籍目录。"""
+    books = {
+        key: _normalize_book_config(key, config)
+        for key, config in DEFAULT_BOOKS.items()
+    }
+
+    for manifest_path in sorted(SIMPLIFIED_DIR.glob("*/book.json")):
+        with manifest_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        book_key = config.get("key") or manifest_path.parent.name
+        config.setdefault("dir", manifest_path.parent.name)
+        books[book_key] = _normalize_book_config(book_key, config)
+
+    for book_dir in sorted(path for path in SIMPLIFIED_DIR.iterdir() if path.is_dir()):
+        if book_dir.name in books:
+            continue
+        md_files = list(book_dir.glob("*.md"))
+        if not md_files:
+            continue
+        books[book_dir.name] = _normalize_book_config(
+            book_dir.name,
+            _autodiscover_book_config(book_dir.name, book_dir),
+        )
+
+    return books
+
+
+BOOKS = load_books()
+
+
 # ── 构建 PDF ─────────────────────────────────────────────────────
 
 def build_pdf(book_key):
     book = BOOKS[book_key]
-    src_dir = os.path.join(os.path.dirname(__file__), "..", "simplified", book["dir"])
-    out_path = os.path.join(os.path.dirname(__file__), "..", "simplified", f"{book['dir']}-simplified.pdf")
+    src_dir = SIMPLIFIED_DIR / book["dir"]
+    out_path = SIMPLIFIED_DIR / f"{book['dir']}-simplified.pdf"
 
     styles = make_styles()
     converter = MarkdownToFlowables(styles)
@@ -708,13 +850,16 @@ def build_pdf(book_key):
     story.append(NextPageTemplate("cover"))
     story.append(Spacer(1, 6 * cm))
     story.append(Paragraph(book["title"], styles["cover_title"]))
-    story.append(Spacer(1, 1 * cm))
-    story.append(
-        Paragraph(
-            book["subtitle"],
-            ParagraphStyle("cover_en", parent=styles["cover_sub"], fontSize=12, textColor=HexColor("#777777")),
+    if book.get("subtitle"):
+        story.append(Spacer(1, 1 * cm))
+        story.append(
+            Paragraph(
+                book["subtitle"],
+                ParagraphStyle("cover_en", parent=styles["cover_sub"], fontSize=12, textColor=HexColor("#777777")),
+            )
         )
-    )
+    else:
+        story.append(Spacer(1, 0.8 * cm))
     story.append(Spacer(1, 1.5 * cm))
     story.append(
         Paragraph(
@@ -722,13 +867,14 @@ def build_pdf(book_key):
             styles["cover_sub"],
         )
     )
-    story.append(Spacer(1, 0.6 * cm))
-    story.append(
-        Paragraph(
-            f'<font color="#D9534F">{book["tags"]}</font>',
-            ParagraphStyle("cover_tags", parent=styles["cover_sub"], fontSize=12),
+    if book.get("tags"):
+        story.append(Spacer(1, 0.6 * cm))
+        story.append(
+            Paragraph(
+                f'<font color="#D9534F">{book["tags"]}</font>',
+                ParagraphStyle("cover_tags", parent=styles["cover_sub"], fontSize=12),
+            )
         )
-    )
 
     story.append(NextPageTemplate("normal"))
     story.append(PageBreak())
@@ -750,8 +896,8 @@ def build_pdf(book_key):
     # ── 正文 ──
     current_part = None
     for fname in book["files"]:
-        fpath = os.path.join(src_dir, fname)
-        if not os.path.exists(fpath):
+        fpath = src_dir / fname
+        if not fpath.exists():
             print(f"WARNING: {fpath} not found, skipping")
             continue
 
@@ -795,7 +941,7 @@ def build_pdf(book_key):
             story.append(PageBreak())
 
         # 每章新页
-        file_flowables = converter.convert_file(fpath)
+        file_flowables = converter.convert_file(str(fpath))
         story.extend(file_flowables)
         story.append(PageBreak())
 
@@ -829,7 +975,7 @@ def build_pdf(book_key):
     )
 
     doc = BaseDocTemplate(
-        out_path,
+        str(out_path),
         pagesize=A4,
         leftMargin=MARGIN_L,
         rightMargin=MARGIN_R,

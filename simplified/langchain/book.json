@@ -1,0 +1,29 @@
+{
+  "key": "langchain",
+  "title": "LangChain 文档精简版",
+  "subtitle": "LangChain, LangGraph, LangSmith Core Guide",
+  "tagline": "Agent 工程速查笔记",
+  "tags": "生态选型 · Agent 框架 · 运行时 · 可观测性与评测",
+  "dir": "langchain",
+  "parts": {
+    "00": "生态与选型",
+    "01": "第一部分：LangChain",
+    "02": "第二部分：LangGraph",
+    "03": "第三部分：LangSmith"
+  },
+  "files": [
+    "langchain-00-01.md",
+    "langchain-01-01.md",
+    "langchain-01-02.md",
+    "langchain-01-03.md",
+    "langchain-01-04.md",
+    "langchain-02-01.md",
+    "langchain-02-02.md",
+    "langchain-02-03.md",
+    "langchain-02-04.md",
+    "langchain-03-01.md",
+    "langchain-03-02.md",
+    "langchain-03-03.md",
+    "langchain-03-04.md"
+  ]
+}
